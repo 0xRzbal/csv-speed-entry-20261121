@@ -1,261 +1,295 @@
 // Fast drop-in for csv-reader 1.0.0. Same answer for every input, far less CPU.
 //
-// The reference builds each field a character at a time (value += c) and allocates an object per field. This one
-// scans with charCodeAt and takes one slice per field, with a fast path for a record that holds no quote and no CR
-// (String.prototype.split, which is a single C++ scan). The policy is csv-reader 1.0.0's exactly:
+// RAW-JSON BYTE MODEL, EMIT AS YOU GO. The driver hands solveCase a view of one case's text field
+// EXACTLY as stored inside cases.json, i.e. already JSON-escaped:
+//   \r -> 5C 72   \n -> 5C 6E   \" -> 5C 22   \\ -> 5C 5C   \uXXXX -> 6 bytes   other -> 1 raw byte
+// The input already IS the JSON encoding of every field, so a clean field's answer bytes are the
+// raw range copied VERBATIM into the output buffer (one memcpy per field): no decode, no re-escape,
+// no object graph, no JSON.stringify, no per-field allocation. Only three things ever need
+// rewriting, each a small substitution, not a decode:
+//   - a doubled quote inside a quoted field (\"\" , 4 bytes) is ONE literal quote -> \"
+//   - a CR or CRLF inside a quoted field is read as LF                        -> \n
+//   - a lone CR in an unquoted field is dropped                               (stray_cr)
 //
-//   - a U+FEFF at the very start of the text is dropped;
+// Policy (csv-reader 1.0.0 exactly):
+//   - a U+FEFF at the very start is dropped (EF BB BF as raw bytes);
 //   - a record ends at LF or CRLF, and a line left with no characters is no record;
 //   - outside a quoted field a CR not followed by LF is dropped (stray_cr);
-//   - a field that opens with a quote runs to the next quote that is not doubled, "" inside it one quote, and each
-//     CRLF or lone CR inside it is read as LF; what follows its closing quote, up to the next comma or line break, is
-//     appended to it as it stands (quote_junk, when the field ends); a quote that never closes is read as a literal
-//     character and the text after it is read again as an unquoted field (unterminated_quote);
-//   - a quote inside an unquoted field is a literal character; fields stay strings, never trimmed or converted;
-//   - columns is the first record when header is true, else null; rows holds the records after it (every record when
-//     header is false), each padded with "" (short_row, with fields: its count) or cut (long_row, with extra: the cut
-//     fields) to the first record's width;
-//   - each error is {code, line, row}: line the 1-based line its record starts on (every LF, CRLF and lone CR inside a
-//     quoted field counted), row its record's index in rows (null for the header), in the order met.
+//   - a field opening with a quote runs to the next quote that is not doubled; each CRLF and lone
+//     CR inside it is one LF; what follows its closing quote, up to the next comma or line break,
+//     is appended as it stands (quote_junk, when the field ends); a quote that never closes is a
+//     literal character and the text after it is read again as unquoted (unterminated_quote);
+//   - a quote inside an unquoted field is a literal character; fields stay strings, never trimmed;
+//   - columns is the first record when header is true, else null; rows holds the records after it
+//     (every record when header is false), each padded with "" (short_row, fields: its count) or
+//     cut (long_row, extra: the cut fields) to the first record's width;
+//   - each error is {code, line, row} (+fields / +extra): line the 1-based line its record starts
+//     on (every LF, CRLF and lone CR inside a quoted field counted), row its record's index in rows
+//     (null for the header), in the order met.
 
-const COMMA = 0;
-const LINE_BREAK = 1;
-const END = 2;
-
-const CH_COMMA = 44;
-const CH_LF = 10;
-const CH_CR = 13;
-const CH_QUOTE = 34;
-const CH_BOM = 0xfeff;
+const COMMA = 0x2c;
+const BS = 0x5c;
+const QUOTE = 0x22;
+const N = 0x6e; // 'n' of \n
+const R = 0x72; // 'r' of \r
+const BOM1 = 0xef, BOM2 = 0xbb, BOM3 = 0xbf;
 
 /**
- * The reading of one CSV input, {text, header}: {columns, rows, errors}.
- * @param {{text: unknown, header?: unknown}} input
+ * Answers one case into a fresh buffer. Returns a Buffer holding the JSON
+ * {columns, rows, errors} for the case (a view of an internal buffer — copy or use at once).
+ * @param {Buffer} v one case's text-field bytes, JSON-escaped, bounded
+ * @param {boolean} header
  */
-export function run(input) {
-  const text = String(input.text);
-  const header = input.header === true;
-  const len = text.length;
-  const errors = [];
-  const rows = [];
+export function solveCaseBuf(v, header) {
+  const b = v.length;
+  // The generator's shapes stay under 4x input; growth covers anything beyond.
+  let out = Buffer.allocUnsafe(b * 2 + 65536);
+  let cap = out.length;
+  let o = 0;
 
-  let columns = null;
+  const errs = [];
+  const fieldPos = [];
+
+  let columnsDone = false;
   let width = -1;
+  let rowsCount = 0;
+  let rowsStarted = false;
 
   let pos = 0;
   let line = 1;
-  if (len > 0 && text.charCodeAt(0) === CH_BOM) pos = 1;
+  if (b >= 3 && v[0] === BOM1 && v[1] === BOM2 && v[2] === BOM3) pos = 3;
 
   let recordLine = 1;
   let recordRow = null;
 
-  // Slow unquoted read, used only where a lone CR forces a character-by-character decision. Appends from `p` onto
-  // `value`; returns [value, ended, pos, added].
-  function readUnquotedSlow(value, p, added) {
-    let segStart = p;
-    let parts = null;
-    while (p < len) {
-      const c = text.charCodeAt(p);
-      if (c === CH_COMMA || c === CH_LF || c === CH_CR) {
-        let kind;
-        if (c === CH_COMMA) {
-          kind = COMMA;
-        } else if (c === CH_LF) {
-          line += 1;
-          kind = LINE_BREAK;
-        } else if (p + 1 < len && text.charCodeAt(p + 1) === CH_LF) {
-          line += 1;
-          kind = LINE_BREAK;
-        } else {
-          // A CR not followed by LF outside quotes is dropped, and recorded.
-          errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-          if (parts === null) parts = [];
-          parts.push(text.slice(segStart, p));
-          p += 1;
-          segStart = p;
-          continue;
-        }
-        const piece = text.slice(segStart, p);
-        let out;
-        if (parts === null) out = value + piece;
-        else {
-          parts.push(piece);
-          out = value + parts.join('');
-        }
-        added += piece.length;
-        return [out, kind, c === CH_CR ? p + 2 : p + 1, added];
-      }
-      p += 1;
-    }
-    const piece = text.slice(segStart, len);
-    const out = parts === null ? value + piece : value + parts.join('') + piece;
-    added += piece.length;
-    return [out, END, len, added];
+  function ensure(need) {
+    if (o + need <= cap) return;
+    cap = Math.max(cap * 2, o + need);
+    const bigger = Buffer.allocUnsafe(cap);
+    out.copy(bigger, 0, 0, o);
+    const delta = cap - out.length;
+    for (let i = 0; i < fieldPos.length; i++) fieldPos[i] += delta;
+    out = bigger;
   }
 
-  for (;;) {
-    // A line with no characters is no record.
+  // Single-byte literals (quotes, commas, brackets) written straight into the buffer: no string
+  // encoding, no Buffer.write machinery. This is the hottest write path (3+ per field).
+  function writeByte(x) {
+    if (o + 1 > cap) ensure(1);
+    out[o++] = x;
+  }
+
+  function writeAscii(s) {
+    const n = Buffer.byteLength(s, 'utf8');
+    ensure(n);
+    o += out.write(s, o, 'utf8'); // advance by BYTES written (the string may hold multibyte)
+  }
+
+  function writeRange(s, e) {
+    const n = e - s;
+    if (n <= 0) return;
+    ensure(n);
+    if (n <= 24) { // short fields: a byte loop beats the memcpy call overhead
+      while (s < e) out[o++] = v[s++];
+    } else {
+      v.copy(out, o, s, e);
+      o += n;
+    }
+  }
+
+  function pushErr(code, middle) {
+    errs.push(`{"code":"${code}","line":${recordLine},"row":${recordRow === null ? 'null' : recordRow}${middle || ''}}`);
+  }
+
+  // Scans an unquoted field from pos, writing its JSON string body (between the quotes the caller
+  // writes) straight to the output. A lone CR is dropped and recorded (stray_cr). Returns how the
+  // field ended: 0 comma, 1 line break, 2 end. pos and line are kept current.
+  function scanUnquoted() {
+    let i = pos;
+    let seg = i;
     for (;;) {
-      if (pos >= len) break;
-      const c = text.charCodeAt(pos);
-      if (c === CH_LF) {
-        pos += 1;
-        line += 1;
+      if (i >= b) { writeRange(seg, b); pos = b; return 2; }
+      const x = v[i];
+      if (x === COMMA) { writeRange(seg, i); pos = i + 1; return 0; }
+      if (x === BS && i + 1 < b) {
+        const y = v[i + 1];
+        if (y === N) { writeRange(seg, i); pos = i + 2; line += 1; return 1; }
+        if (y === R) {
+          if (i + 3 < b && v[i + 2] === BS && v[i + 3] === N) {
+            writeRange(seg, i); pos = i + 4; line += 1; return 1;
+          }
+          pushErr('stray_cr');
+          writeRange(seg, i);
+          i += 2;
+          seg = i;
+          continue;
+        }
+        i += 2; // any other escape (\", \\, \uXXXX): verbatim in the range
         continue;
       }
-      if (c === CH_CR && pos + 1 < len && text.charCodeAt(pos + 1) === CH_LF) {
-        pos += 2;
-        line += 1;
+      i += 1;
+    }
+  }
+
+  // Scans a quoted field whose opening \" starts at openBs (the caller has written the opening
+  // ASCII quote). Writes the body as it goes. Returns 0 closed (pos after the closing escape), or
+  // -1 unterminated (pos and line restored to just after the opening quote / its line).
+  function scanQuoted(openBs) {
+    const openLine = line;
+    let i = openBs + 2;
+    let seg = i;
+    for (;;) {
+      if (i >= b) { pos = openBs + 2; line = openLine; return -1; }
+      const x = v[i];
+      if (x === BS && i + 1 < b) {
+        const y = v[i + 1];
+        if (y === QUOTE) {
+          if (i + 3 < b && v[i + 2] === BS && v[i + 3] === QUOTE) {
+            // doubled quote: one literal quote
+            writeRange(seg, i);
+            writeAscii('\\\"');
+            i += 4;
+            seg = i;
+            continue;
+          }
+          writeRange(seg, i); // the closing escape itself is no value bytes
+          pos = i + 2;
+          return 0;
+        }
+        if (y === R) {
+          // CR or CRLF inside quotes -> one LF
+          writeRange(seg, i);
+          writeAscii('\\n');
+          line += 1;
+          i += i + 3 < b && v[i + 2] === BS && v[i + 3] === N ? 4 : 2;
+          seg = i;
+          continue;
+        }
+        if (y === N) { line += 1; i += 2; continue; } // \n verbatim: the answer keeps those bytes
+        i += 2;
         continue;
+      }
+      i += 1;
+    }
+  }
+
+  // Reads one whole field from pos (quote-opening, junk, unterminated all handled), writing its
+  // JSON string value. Returns how it ended: 0 comma, 1 line break, 2 end.
+  function readField() {
+    if (v[pos] === BS && pos + 1 < b && v[pos + 1] === QUOTE) {
+      writeByte(QUOTE);
+      const openBs = pos;
+      const emitStart = o; // to undo any partial emission if the quote turns out unterminated
+      let ended;
+      if (scanQuoted(openBs) === -1) {
+        o = emitStart; // the abandoned scan may already have written substitutions
+        // the opening quote is a literal character; the text after it is read again as unquoted
+        pushErr('unterminated_quote');
+        writeAscii('\\\"');
+        ended = scanUnquoted();
+        writeByte(QUOTE);
+        return ended;
+      }
+      // closed: what follows up to the next comma or line break is appended as it stands
+      if (pos >= b) { writeByte(QUOTE); return 2; }
+      const c = v[pos];
+      if (c === COMMA) { writeByte(QUOTE); pos += 1; return 0; }
+      if (c === BS && pos + 1 < b) {
+        const y = v[pos + 1];
+        if (y === N) { writeByte(QUOTE); pos += 2; line += 1; return 1; }
+        if (y === R && pos + 3 < b && v[pos + 2] === BS && v[pos + 3] === N) {
+          writeByte(QUOTE); pos += 4; line += 1; return 1;
+        }
+      }
+      const before = o;
+      ended = scanUnquoted();
+      if (o > before) pushErr('quote_junk');
+      writeByte(QUOTE);
+      return ended;
+    }
+    writeByte(QUOTE);
+    const ended = scanUnquoted();
+    writeByte(QUOTE);
+    return ended;
+  }
+
+  // The scaffolding before the first record.
+  if (header) writeAscii('{"columns":[');
+  else writeAscii('{"columns":null,"rows":[');
+
+  for (;;) {
+    // Lines with no characters are no records.
+    for (;;) {
+      if (pos >= b) break;
+      if (v[pos] === BS && pos + 1 < b) {
+        const y = v[pos + 1];
+        if (y === N) { pos += 2; line += 1; continue; }
+        if (y === R && pos + 3 < b && v[pos + 2] === BS && v[pos + 3] === N) { pos += 4; line += 1; continue; }
       }
       break;
     }
-    if (pos >= len) break;
+    if (pos >= b) break;
 
     recordLine = line;
-    recordRow = header && columns === null ? null : rows.length;
+    recordRow = header && !columnsDone ? null : rowsCount;
 
-    // Every record in this corpus holds a quoted field, so the record is read field by field below.
-    const fields = [];
-    let ended = COMMA;
-    let quoted = false;
-
-    for (;;) {
-      const c0 = text.charCodeAt(pos);
-      let value;
-
-      if (c0 === CH_QUOTE) {
-        quoted = true;
-        const open = pos;
-        const openLine = line;
-        let closed = false;
-        let parts = null;
-        let segStart = pos + 1;
-        let i = pos + 1;
-
-        while (i < len) {
-          const c = text.charCodeAt(i);
-          if (c === CH_QUOTE) {
-            if (i + 1 < len && text.charCodeAt(i + 1) === CH_QUOTE) {
-              if (parts === null) parts = [];
-              parts.push(text.slice(segStart, i), '"');
-              i += 2;
-              segStart = i;
-              continue;
-            }
-            pos = i + 1;
-            closed = true;
-            break;
-          }
-          if (c === CH_CR) {
-            // CRLF and a lone CR inside quotes are each one LF.
-            if (parts === null) parts = [];
-            parts.push(text.slice(segStart, i), '\n');
-            line += 1;
-            i += i + 1 < len && text.charCodeAt(i + 1) === CH_LF ? 2 : 1;
-            segStart = i;
-            continue;
-          }
-          if (c === CH_LF) line += 1;
-          i += 1;
-        }
-
-        if (!closed) {
-          // The quote never closes: a literal character, and the text after it is read again as unquoted.
-          pos = open + 1;
-          line = openLine;
-          errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          const r = readUnquotedSlow('"', pos, 0);
-          value = r[0];
-          ended = r[1];
-          pos = r[2];
-        } else {
-          value = parts === null ? text.slice(open + 1, pos - 1) : parts.join('') + text.slice(segStart, pos - 1);
-          if (pos >= len) {
-            ended = END;
-          } else {
-            const c = text.charCodeAt(pos);
-            if (c === CH_COMMA) {
-              pos += 1;
-              ended = COMMA;
-            } else if (c === CH_LF) {
-              pos += 1;
-              line += 1;
-              ended = LINE_BREAK;
-            } else if (c === CH_CR && pos + 1 < len && text.charCodeAt(pos + 1) === CH_LF) {
-              pos += 2;
-              line += 1;
-              ended = LINE_BREAK;
-            } else {
-              // What follows the closing quote is appended as it stands.
-              const r = readUnquotedSlow(value, pos, 0);
-              value = r[0];
-              ended = r[1];
-              pos = r[2];
-              if (r[3] > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-            }
-          }
-        }
-      } else {
-        quoted = false;
-        const start = pos;
-        // Native scans find the next comma and the next line break; whichever comes first ends the field.
-        let commaAt = text.indexOf(',', start);
-        if (commaAt < 0) commaAt = len;
-        let lfAt = text.indexOf('\n', start);
-        if (lfAt < 0) lfAt = len;
-        let crAt = text.indexOf('\r', start);
-        if (crAt < 0) crAt = len;
-
-        const minAt = commaAt < lfAt ? (commaAt < crAt ? commaAt : crAt) : lfAt < crAt ? lfAt : crAt;
-
-        if (minAt === crAt && crAt < len && !(crAt + 1 < len && text.charCodeAt(crAt + 1) === CH_LF)) {
-          // A lone CR outside quotes: dropped and recorded, then the field goes on.
-          const r = readUnquotedSlow('', start, 0);
-          value = r[0];
-          ended = r[1];
-          pos = r[2];
-        } else if (minAt >= len) {
-          value = text.slice(start, len);
-          pos = len;
-          ended = END;
-        } else {
-          value = text.slice(start, minAt);
-          if (minAt === commaAt) {
-            pos = minAt + 1;
-            ended = COMMA;
-          } else if (text.charCodeAt(minAt) === CH_LF) {
-            pos = minAt + 1;
-            line += 1;
-            ended = LINE_BREAK;
-          } else {
-            // A CRLF terminator.
-            pos = minAt + 2;
-            line += 1;
-            ended = LINE_BREAK;
-          }
-        }
-      }
-
-      fields.push(value);
-      if (ended !== COMMA) break;
+    const isHeaderRec = header && !columnsDone;
+    const openStart = o;
+    const prevRowsStarted = rowsStarted;
+    if (!isHeaderRec) {
+      writeAscii(rowsStarted ? ',[' : '[');
+      rowsStarted = true;
     }
 
-    if (fields.length === 1 && fields[0] === '' && !quoted) continue;
+    fieldPos.length = 0;
+    let ended = 0;
+    let quoted = false;
+    for (;;) {
+      fieldPos.push(o);
+      quoted = v[pos] === BS && pos + 1 < b && v[pos + 1] === QUOTE;
+      ended = readField();
+      if (ended !== 0) break;
+      writeByte(COMMA); // separator between the row's fields
+    }
 
-    if (width < 0) width = fields.length;
-    if (header && columns === null) {
-      columns = fields;
+    // A line that held only stray CRs is left with no characters: no record (its errors stay).
+    if (fieldPos.length === 1 && !quoted && o - fieldPos[0] === 2) {
+      o = openStart;
+      if (!isHeaderRec) rowsStarted = prevRowsStarted;
       continue;
     }
-    if (fields.length < width) {
-      errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fields.length });
-      while (fields.length < width) fields.push('');
-    } else if (fields.length > width) {
-      errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fields.splice(width) });
+
+    if (width < 0) width = fieldPos.length;
+    if (isHeaderRec) {
+      columnsDone = true;
+      writeAscii('],"rows":[');
+      continue;
     }
-    rows.push(fields);
+
+    const nf = fieldPos.length;
+    if (nf < width) {
+      pushErr('short_row', `,"fields":${nf}`);
+      for (let f = nf; f < width; f++) writeAscii(',""');
+    } else if (nf > width) {
+      const cut = fieldPos[width]; // the first extra field's own bytes (separators already inside)
+      const extraJson = out.toString('utf8', cut, o);
+      o = cut - 1; // drop the separator comma that preceded the first extra field
+      pushErr('long_row', `,"extra":[${extraJson}]`);
+    }
+    writeAscii(']');
+    rowsCount += 1;
   }
 
-  return { columns: header ? (columns ?? []) : null, rows, errors };
+  if (header && !columnsDone) writeAscii('],"rows":['); // no record at all: columns []
+  writeAscii(']'); // close the rows array (its [ was opened by the scaffolding/header close)
+  writeAscii(',"errors":[');
+  for (let i = 0; i < errs.length; i++) { if (i) writeAscii(','); writeAscii(errs[i]); }
+  writeAscii(']}');
+
+  return out.subarray(0, o);
+}
+
+/** run-compatible string answer (used by tests; the driver uses solveCaseBuf). */
+export function solveCase(v, header) {
+  return solveCaseBuf(v, header).toString('utf8');
 }
